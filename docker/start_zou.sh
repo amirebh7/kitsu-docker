@@ -1,39 +1,54 @@
 #!/bin/bash
+
 if [ -z "${SECRET_KEY}" ]; then
     export SECRET_KEY=$(head -c 32 /dev/urandom | base64)
     echo "Generated a temporary SECRET_KEY for this container."
 fi
 
-# آماده‌سازی پوشه‌ها و پاک کردن قفل‌های احتمالی قبلی
-mkdir -p /var/run/postgresql /var/run/redis /var/lib/postgresql/17/main /opt/zou/previews
-chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql
-chown -R redis:redis /var/run/redis /var/lib/redis || true
+# ۱. تنظیم پوشه‌ها و دسترسی‌های مورد نیاز پستگرس و ردیس
+mkdir -p /var/run/postgresql /var/run/redis /var/lib/postgresql/17/main /opt/zou/previews /opt/zou/logs
+chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql /etc/postgresql /var/log/postgresql
+chown -R redis:redis /var/run/redis /var/lib/redis 2>/dev/null || true
 chmod 700 /var/lib/postgresql/17/main
-rm -f /var/lib/postgresql/17/main/postmaster.pid /var/run/redis/redis-server.pid
+chmod 2775 /var/run/postgresql
 
-# اگر والیوم دیتابیس خام است، کلاستر پستگرس را بساز
+# ۲. پاک کردن هرگونه فایل قفل (PID/Socket) از ری‌استارت قبلی
+rm -f /var/lib/postgresql/17/main/postmaster.pid /var/run/postgresql/.s.PGSQL.* /var/run/redis/redis-server.pid
+
+# ۳. اگر والیوم کاملاً خام باشد، فقط initdb را اجرا کن (بدون روشن کردن سرویس)
 if [ ! -f "/var/lib/postgresql/17/main/PG_VERSION" ]; then
-    echo "Initializing PostgreSQL cluster on volume..."
+    echo "[INIT] Empty volume detected. Running initdb..."
+    rm -rf /var/lib/postgresql/17/main/*
     su - postgres -c "/usr/lib/postgresql/17/bin/initdb -D /var/lib/postgresql/17/main"
+else
+    # تعمیر خودکار ژورنال در صورت خاموشی ناگهانی قبلی
+    su - postgres -c "/usr/lib/postgresql/17/bin/pg_resetwal -f -D /var/lib/postgresql/17/main" >/dev/null 2>&1 || true
 fi
 
-# بررسی و ساخت یوزر root و دیتابیس zoudb (اگر از قبل ساخته نشده باشند)
-service postgresql start
-service redis-server start
+# ۴. اسکریپت پس‌زمینه: صبر می‌کند تا Supervisord پستگرس را روشن کند، سپس دیتابیس و ادمین را بررسی/تکمیل می‌کند
+(
+    echo "[BG-SETUP] Waiting for PostgreSQL to accept connections on socket..."
+    for i in {1..30}; do
+        if su - postgres -c "pg_isready -q"; then
+            echo "[BG-SETUP] PostgreSQL is UP!"
+            break
+        fi
+        sleep 1
+    done
 
-if ! su - postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='root'\"" | grep -q 1; then
-    echo "Creating PostgreSQL 'root' superuser and 'zoudb' database..."
-    su - postgres -c "createuser -s root"
-    su - postgres -c "createdb -T template0 -E UTF8 --owner root zoudb"
-    /opt/zou/env/bin/zou upgrade-db
-    /opt/zou/env/bin/zou init-data
-    /opt/zou/env/bin/zou create-admin admin@example.com --password mysecretpassword
-fi
+    # ساخت نقش root و دیتابیس zoudb در صورت عدم وجود
+    su - postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='root'\"" | grep -q 1 || su - postgres -c "createuser -s root"
+    su - postgres -c "psql -lqt | cut -d \| -f 1 | grep -qw zoudb" || su - postgres -c "createdb -T template0 -E UTF8 --owner root zoudb"
 
-# خاموش کردن کامل سرویس‌های موقت و آزاد کردن پورت‌ها قبل از اجرای Supervisord
-service postgresql stop
-service redis-server stop
-pkill -9 redis-server || true
-rm -f /var/run/redis/redis-server.pid
+    # تکمیل جداول، داده‌های اولیه و ساخت ادمین
+    /opt/zou/env/bin/zou upgrade-db || true
+    /opt/zou/env/bin/zou init-data || true
+    /opt/zou/env/bin/zou create-admin admin@example.com --password mysecretpassword || true
 
-/usr/bin/supervisord -c /etc/supervisord.conf
+    echo "[BG-SETUP] Restarting Gunicorn to apply database state..."
+    supervisorctl -c /etc/supervisord.conf restart gunicorn gunicorn-events
+    echo "[BG-SETUP] ALL DONE! Kitsu is ready."
+) &
+
+# ۵. اجرای مستقیم Supervisord به عنوان پروسه اصلی کانتینر
+exec /usr/bin/supervisord -c /etc/supervisord.conf
