@@ -4,8 +4,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PG_VERSION=17
 ENV DB_USERNAME=root DB_HOST= PLUGIN_FOLDER=/opt/zou/plugins
 # Versions are defined in versions.env
-ARG ZOU_VERSION
-ARG KITSU_VERSION
+ARG ZOU_VERSION=1.1.2
+ARG KITSU_VERSION=1.0.79
 
 USER root
 
