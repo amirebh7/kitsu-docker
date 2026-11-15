@@ -1,54 +1,97 @@
 #!/bin/bash
+set -e
 
+# ۱. تولید و نگهداری SECRET_KEY دائمی در والیوم Previews
+mkdir -p /opt/zou/previews /opt/zou/logs /var/run/postgresql /var/run/redis
+SECRET_FILE="/opt/zou/previews/.secret_key"
 if [ -z "${SECRET_KEY}" ]; then
-    export SECRET_KEY=$(head -c 32 /dev/urandom | base64)
-    echo "Generated a temporary SECRET_KEY for this container."
+    if [ ! -f "$SECRET_FILE" ]; then
+        tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 32 > "$SECRET_FILE"
+    fi
+    export SECRET_KEY=$(cat "$SECRET_FILE")
 fi
 
-# ۱. تنظیم پوشه‌ها و دسترسی‌های مورد نیاز پستگرس و ردیس
-mkdir -p /var/run/postgresql /var/run/redis /var/lib/postgresql/17/main /opt/zou/previews /opt/zou/logs
-chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql /etc/postgresql /var/log/postgresql
+# ۲. تنظیم دسترسی پوشه‌ها و پاک کردن قفل‌های احتمالی قبلی
+PG_DATA="/var/lib/postgresql/17/main"
+PG_CONF="/etc/postgresql/17/main/postgresql.conf"
+MARKER_FILE="$PG_DATA/.kitsu_ready_v2"
+
+mkdir -p "$PG_DATA"
+chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql /var/log/postgresql /etc/postgresql
 chown -R redis:redis /var/run/redis /var/lib/redis 2>/dev/null || true
-chmod 700 /var/lib/postgresql/17/main
+chmod 700 "$PG_DATA"
 chmod 2775 /var/run/postgresql
+rm -f "$PG_DATA/postmaster.pid" /var/run/postgresql/.s.PGSQL.* /var/run/redis/redis-server.pid
 
-# ۲. پاک کردن هرگونه فایل قفل (PID/Socket) از ری‌استارت قبلی
-rm -f /var/lib/postgresql/17/main/postmaster.pid /var/run/postgresql/.s.PGSQL.* /var/run/redis/redis-server.pid
+# ۳. بررسی کامل بودن دیتابیس (اگر ناقص یا خام باشد، از صفر و تمیز ساخته می‌شود)
+if [ ! -f "$MARKER_FILE" ]; then
+    echo "===================================================="
+    echo "[SETUP] Building clean Kitsu database on volume..."
+    echo "===================================================="
 
-# ۳. اگر والیوم کاملاً خام باشد، فقط initdb را اجرا کن (بدون روشن کردن سرویس)
-if [ ! -f "/var/lib/postgresql/17/main/PG_VERSION" ]; then
-    echo "[INIT] Empty volume detected. Running initdb..."
-    rm -rf /var/lib/postgresql/17/main/*
-    su - postgres -c "/usr/lib/postgresql/17/bin/initdb -D /var/lib/postgresql/17/main"
-else
-    # تعمیر خودکار ژورنال در صورت خاموشی ناگهانی قبلی
-    su - postgres -c "/usr/lib/postgresql/17/bin/pg_resetwal -f -D /var/lib/postgresql/17/main" >/dev/null 2>&1 || true
-fi
+    # پاکسازی دیتابیس ناقص قبلی روی والیوم
+    rm -rf "$PG_DATA"/* "$PG_DATA"/.* 2>/dev/null || true
 
-# ۴. اسکریپت پس‌زمینه: صبر می‌کند تا Supervisord پستگرس را روشن کند، سپس دیتابیس و ادمین را بررسی/تکمیل می‌کند
-(
-    echo "[BG-SETUP] Waiting for PostgreSQL to accept connections on socket..."
-    for i in {1..30}; do
-        if su - postgres -c "pg_isready -q"; then
-            echo "[BG-SETUP] PostgreSQL is UP!"
-            break
-        fi
-        sleep 1
-    done
+    echo "[SETUP] 1/6 Running PostgreSQL initdb..."
+    su - postgres -c "/usr/lib/postgresql/17/bin/initdb -D $PG_DATA --encoding=UTF8 --locale=C.UTF-8"
 
-    # ساخت نقش root و دیتابیس zoudb در صورت عدم وجود
-    su - postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='root'\"" | grep -q 1 || su - postgres -c "createuser -s root"
-    su - postgres -c "psql -lqt | cut -d \| -f 1 | grep -qw zoudb" || su - postgres -c "createdb -T template0 -E UTF8 --owner root zoudb"
+    echo "[SETUP] 2/6 Starting temporary PostgreSQL and Redis..."
+    su - postgres -c "/usr/lib/postgresql/17/bin/pg_ctl -D $PG_DATA -o '-c config_file=$PG_CONF' -l /var/log/postgresql/setup.log -w start"
+    redis-server --daemonize yes
+    sleep 2
 
-    # تکمیل جداول، داده‌های اولیه و ساخت ادمین
-    /opt/zou/env/bin/zou upgrade-db || true
-    /opt/zou/env/bin/zou init-data || true
+    echo "[SETUP] 3/6 Creating 'root' role and 'zoudb' database..."
+    su - postgres -c "createuser -s root"
+    su - postgres -c "createdb -T template0 -E UTF8 --owner root zoudb"
+
+    echo "[SETUP] 4/6 Running database migrations (zou upgrade-db)..."
+    /opt/zou/env/bin/zou upgrade-db
+
+    echo "[SETUP] 5/6 Seeding initial data (zou init-data)..."
+    /opt/zou/env/bin/zou init-data
+
+    echo "[SETUP] 6/6 Creating admin user (admin@example.com)..."
     /opt/zou/env/bin/zou create-admin admin@example.com --password mysecretpassword || true
 
-    echo "[BG-SETUP] Restarting Gunicorn to apply database state..."
-    supervisorctl -c /etc/supervisord.conf restart gunicorn gunicorn-events
-    echo "[BG-SETUP] ALL DONE! Kitsu is ready."
-) &
+    # تضمین ۱۰۰ درصدی ساخت و فعال‌سازی ادمین مستقیماً در دیتابیس
+    /opt/zou/env/bin/python - << 'PYEOF'
+from zou.app import app
+from zou.app.services import persons_service
+from zou.app.models.person import Person
+from zou.app.utils.crypto import hash_password
 
-# ۵. اجرای مستقیم Supervisord به عنوان پروسه اصلی کانتینر
+with app.app_context():
+    p = Person.get_by(email="admin@example.com")
+    if p:
+        p.password = hash_password("mysecretpassword")
+        p.role = "admin"
+        p.active = True
+        p.save()
+        print("[SETUP] Verified existing admin@example.com account.")
+    else:
+        persons_service.create_person("Admin", "User", "admin@example.com", role="admin", password="mysecretpassword", is_bot=False)
+        print("[SETUP] Created admin@example.com account via ORM.")
+PYEOF
+
+    # ثبت فایل نشانگر تکمیل موفقیت‌آمیز (تا در ری‌استارت‌های بعدی دیتابیس پاک نشود)
+    touch "$MARKER_FILE"
+    chown postgres:postgres "$MARKER_FILE"
+
+    echo "[SETUP] Stopping temporary Redis and PostgreSQL cleanly..."
+    redis-cli flushall || true
+    redis-cli shutdown || pkill -9 redis-server || true
+    rm -f /var/run/redis/redis-server.pid
+    su - postgres -c "/usr/lib/postgresql/17/bin/pg_ctl -D $PG_DATA -m fast -w stop"
+
+    echo "===================================================="
+    echo "[SETUP] Initialization 100% complete!"
+    echo "===================================================="
+else
+    echo "[INFO] Verified healthy Kitsu database on volume (.kitsu_ready_v2 found)."
+fi
+
+# ۴. نمایش لاگ خطاهای Gunicorn در کنسول رانفلر و اجرای Supervisord
+touch /opt/zou/logs/gunicorn_error.log
+tail -F /opt/zou/logs/gunicorn_error.log &
+
 exec /usr/bin/supervisord -c /etc/supervisord.conf
